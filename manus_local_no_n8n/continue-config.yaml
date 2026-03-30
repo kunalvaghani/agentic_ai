@@ -1,0 +1,23 @@
+name: Local Manus Lite
+version: 0.0.1
+schema: v1
+
+models:
+  - name: Local Chat
+    provider: ollama
+    model: qwen3:8b
+    apiBase: http://127.0.0.1:11434
+    capabilities:
+      - tool_use
+
+  - name: Local Coder
+    provider: ollama
+    model: qwen2.5-coder:7b
+    apiBase: http://127.0.0.1:11434
+    capabilities:
+      - tool_use
+
+rules:
+  - Keep edits minimal and explain file changes before making broad refactors.
+  - Run tests after modifying source files whenever a test command exists.
+  - Never delete files or install packages unless I explicitly asked.

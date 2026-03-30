@@ -1,0 +1,7 @@
+Requested model: qwen3.5:latest
+Effective model: qwen3.5:latest
+
+--- step 1 ---
+{
+  "follow_ups": ["What kind of task would you like help with today?", "Can you show me what files are in my workspace?", "I'd like to browse a website - can you help with that?", "What commands can you run for me?", "Can you search for specific information for me?"]
+}

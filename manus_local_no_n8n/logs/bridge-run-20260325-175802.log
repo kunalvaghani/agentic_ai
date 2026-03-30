@@ -1,0 +1,15 @@
+Requested model: qwen3.5:latest
+Effective model: qwen3.5:latest
+
+=== planner step 1 ===
+[planner] mode=finish reason=Generated title based on chat history and guidelines
+
+=== storage save warning ===
+Traceback (most recent call last):
+  File "D:\Phython Project\manus_local_5\manus_local_no_n8n\bridge_server.py", line 286, in run_local_desktop_agent
+    store_text_artifact(
+  File "D:\Phython Project\manus_local_5\manus_local_no_n8n\agent\storage_manager.py", line 181, in store_text_artifact
+    target.write_text(text, encoding="utf-8")
+  File "C:\Users\kunal\AppData\Local\Programs\Python\Python311\Lib\pathlib.py", line 1075, in write_text
+    raise TypeError('data must be str, not %s' %
+TypeError: data must be str, not dict

@@ -1,0 +1,11 @@
+ollama
+python-dotenv
+playwright
+pyautogui
+pygetwindow
+pyperclip
+psutil
+mss
+pillow
+fastapi
+uvicorn
