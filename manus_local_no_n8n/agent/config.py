@@ -1,7 +1,7 @@
-
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,9 +28,6 @@ def _keep_alive_env(name: str, default: str) -> Any:
     return value
 
 
-import re
-
-
 @dataclass(frozen=True)
 class Settings:
     ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -48,13 +45,17 @@ class Settings:
     planner_model: str = os.getenv("OLLAMA_PLANNER_MODEL", os.getenv("OLLAMA_CHAT_MODEL", "qwen3:8b"))
     verifier_model: str = os.getenv("OLLAMA_VERIFIER_MODEL", os.getenv("OLLAMA_CHAT_MODEL", "qwen3:8b"))
 
-    # Speed knobs: keep the same model, optimize runtime behavior.
+    # Speed knobs
     ollama_keep_alive: Any = _keep_alive_env("OLLAMA_KEEP_ALIVE", "-1")
     ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
     ollama_temperature: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
     planner_temperature: float = float(os.getenv("OLLAMA_PLANNER_TEMPERATURE", "0.1"))
     verifier_temperature: float = float(os.getenv("OLLAMA_VERIFIER_TEMPERATURE", "0.05"))
     ollama_think: Any = os.getenv("OLLAMA_THINK", "false").strip().lower() not in {"0", "false", "no", "off"}
+
+    # Policy knobs
+    agent_policy_mode: str = os.getenv("AGENT_POLICY_MODE", "builder").strip().lower()
+    agent_extra_system_prompt: str = os.getenv("AGENT_EXTRA_SYSTEM_PROMPT", "").strip()
 
     # Memory subsystem
     memory_enabled: bool = _bool_env("MEMORY_ENABLED", True)

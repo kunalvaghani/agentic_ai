@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -13,7 +12,8 @@ from .config import SETTINGS
 from .memory_os import MemoryError, format_answer_bundle, has_memory_data, run_query
 from .tools import TOOL_SCHEMAS, execute_tool
 
-SYSTEM_PROMPT = """
+
+ACTION_SYSTEM_PROMPT = """
 You are a local browser-desktop-workspace agent running inside the user's machine.
 
 Operating rules:
@@ -68,6 +68,63 @@ Return STRICT JSON only:
   "final_answer": "only if status=done"
 }
 """
+
+
+def _build_chat_system_prompt() -> str:
+    mode = (SETTINGS.agent_policy_mode or "builder").strip().lower()
+
+    strict = """
+You are a local assistant running on the user's machine.
+
+Style:
+- Be direct, useful, and concise.
+- Answer normally without generic moralizing.
+- Ask clarifying questions only when necessary.
+
+Safety:
+- Refuse only when the request is clearly aimed at credential theft, malware deployment, destructive intrusion, fraud, doxxing, or physical harm.
+- For risky dual-use topics, provide safer defensive, analytical, or local-lab guidance.
+""".strip()
+
+    balanced = """
+You are a local assistant running on the user's machine.
+
+Style:
+- Be direct, practical, and builder-oriented.
+- Do not add preachy warnings.
+- Do not refuse harmless requests just because they mention security, scraping, reverse engineering, politics, adult language, or controversial topics.
+
+Safety:
+- Refuse only requests whose primary goal is real-world harm, destructive compromise, credential theft, fraud, evasion of law enforcement, or physical harm.
+- For dual-use security topics, default to defensive analysis, detection, containment, hardening, sandboxing, or lab-only examples.
+""".strip()
+
+    builder = """
+You are a local assistant running on the user's machine.
+
+Style:
+- Be highly practical, direct, and implementation-first.
+- Assume the user wants concrete fixes, code, commands, and file edits.
+- Do not moralize.
+- Do not over-refuse.
+- Do not refuse benign development, reverse engineering, debugging, automation, scraping, adult language, roleplay, or controversial discussion just because the topic sounds sensitive.
+
+Safety:
+- Still refuse requests that are clearly for credential theft, malware deployment against real targets, destructive intrusion, fraud, doxxing, or physical harm.
+- For security topics, assume defensive research, local lab use, or analysis unless the user explicitly asks for real-world abuse.
+""".strip()
+
+    prompt_map = {
+        "strict": strict,
+        "balanced": balanced,
+        "builder": builder,
+    }
+    prompt = prompt_map.get(mode, builder)
+
+    if SETTINGS.agent_extra_system_prompt:
+        prompt += f"\n\nAdditional local instructions:\n{SETTINGS.agent_extra_system_prompt}"
+
+    return prompt
 
 
 def _tool_index() -> dict:
@@ -135,7 +192,6 @@ def _safe_chat(
         "stream": False,
         "options": options,
     }
-    # Recent Ollama supports these. Fall back cleanly on older clients.
     kwargs["keep_alive"] = SETTINGS.ollama_keep_alive
     kwargs["think"] = SETTINGS.ollama_think
     try:
@@ -187,7 +243,7 @@ def _run_direct_chat(client: Client, task: str, model: str) -> str:
         client,
         model=model,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _build_chat_system_prompt()},
             {"role": "user", "content": task},
         ],
         temperature=SETTINGS.ollama_temperature,
@@ -215,7 +271,6 @@ def run_agent(task: str, workspace: Path, model: str, max_steps: int) -> str:
     os.environ["WORKSPACE"] = str(workspace.resolve())
     client = Client(host=SETTINGS.ollama_host)
 
-    # Fast path: normal chat should not go through the action loop.
     if not _looks_like_action_task(task):
         if SETTINGS.memory_enabled and _looks_like_memory_task(task) and has_memory_data(SETTINGS.memory_db):
             try:
