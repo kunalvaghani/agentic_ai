@@ -1,15 +1,16 @@
+
 from __future__ import annotations
 
 import argparse
-import os
 import json
+import os
 from pathlib import Path
-
-from .planner_executor_verifier import run_planner_executor_verifier_agent
+from typing import Any
 
 from ollama import Client
 
 from .config import SETTINGS
+from .memory_os import MemoryError, format_answer_bundle, has_memory_data, run_query
 from .tools import TOOL_SCHEMAS, execute_tool
 
 SYSTEM_PROMPT = """
@@ -32,6 +33,41 @@ Operating rules:
 - Prefer automatic storage names unless the user explicitly asks for a specific filename.
 - When you finish, summarize exactly what you changed, where you saved it under storage, and what still needs manual work.
 """.strip()
+
+PLANNER_PROMPT = """You are the PLANNER for a local desktop/browser agent.
+
+Your job:
+- decide exactly ONE next step
+- prefer the smallest safe step
+- prefer browser/file/native tools over fragile UI actions
+- do not claim the task is done unless it is actually complete
+
+Return STRICT JSON only:
+{
+  "mode": "tool" | "finish",
+  "reason": "short reason",
+  "tool_name": "tool name if mode=tool",
+  "arguments": {},
+  "success_check": "what the verifier should confirm",
+  "final_answer": "only if mode=finish"
+}
+"""
+
+VERIFIER_PROMPT = """You are the VERIFIER for a local desktop/browser agent.
+
+Your job:
+- judge whether the last tool action moved the task forward
+- decide if the overall task is finished
+- never assume success without evidence from the tool output
+
+Return STRICT JSON only:
+{
+  "status": "done" | "continue" | "retry",
+  "reason": "short reason",
+  "next_hint": "what should happen next",
+  "final_answer": "only if status=done"
+}
+"""
 
 
 def _tool_index() -> dict:
@@ -82,118 +118,116 @@ def _extract_json_object(text: str) -> dict:
         return {}
 
 
-def _call_json_model(client: Client, model: str, system_prompt: str, user_prompt: str) -> dict:
-    response = client.chat(
+def _safe_chat(
+    client: Client,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+) -> dict:
+    options = {
+        "temperature": temperature,
+        "num_ctx": SETTINGS.ollama_num_ctx,
+    }
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": options,
+    }
+    # Recent Ollama supports these. Fall back cleanly on older clients.
+    kwargs["keep_alive"] = SETTINGS.ollama_keep_alive
+    kwargs["think"] = SETTINGS.ollama_think
+    try:
+        return client.chat(**kwargs)
+    except TypeError:
+        kwargs.pop("keep_alive", None)
+        kwargs.pop("think", None)
+        return client.chat(**kwargs)
+
+
+def _call_json_model(client: Client, model: str, system_prompt: str, user_prompt: str, temperature: float) -> dict:
+    response = _safe_chat(
+        client,
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        stream=False,
-        options={"temperature": 0.1},
+        temperature=temperature,
     )
     content = response.get("message", {}).get("content", "")
     return _extract_json_object(content)
 
 
-PLANNER_PROMPT = """You are the PLANNER for a local desktop/browser agent.
-
-Your job:
-- decide exactly ONE next step
-- prefer the smallest safe step
-- prefer browser/file/native tools over fragile UI actions
-- do not claim the task is done unless it is actually complete
-
-Return STRICT JSON only:
-{
-  "mode": "tool" | "finish",
-  "reason": "short reason",
-  "tool_name": "tool name if mode=tool",
-  "arguments": {},
-  "success_check": "what the verifier should confirm",
-  "final_answer": "only if mode=finish"
-}
-"""
-
-
-VERIFIER_PROMPT = """You are the VERIFIER for a local desktop/browser agent.
-
-Your job:
-- judge whether the last tool action moved the task forward
-- decide if the overall task is finished
-- never assume success without evidence from the tool output
-
-Return STRICT JSON only:
-{
-  "status": "done" | "continue" | "retry",
-  "reason": "short reason",
-  "next_hint": "what should happen next",
-  "final_answer": "only if status=done"
-}
-"""
-
 def _looks_like_action_task(task: str) -> bool:
     t = task.lower()
     action_words = [
-        "open", "click", "type", "press", "search", "go to", "visit",
-        "save", "download", "take a screenshot", "focus", "run",
-        "read file", "summarize this page", "organize", "move", "launch"
+        "open", "click", "type", "press", "search", "go to", "visit", "browse",
+        "save", "download", "take a screenshot", "focus", "run", "launch",
+        "read file", "organize", "move", "scroll", "drag", "select", "close",
+        "create file", "write file", "edit file", "modify file", "build app",
+        "create app", "make all necessary files", "workspace", "current workspace",
     ]
     return any(word in t for word in action_words)
 
 
-def _route_task(client: Client, model: str, task: str) -> dict:
-    route_prompt = f"""
-Classify this task into exactly one mode:
-- chat: normal Q&A, ideas, code snippets, explanations
-- codegen: create/update multiple files in the workspace
-- action: browser/desktop/file operations that require tools
+def _looks_like_memory_task(task: str) -> bool:
+    t = task.lower()
+    memory_words = [
+        "according to", "from the docs", "from my docs", "from memory", "use memory",
+        "search memory", "search the docs", "what does the document say", "cite",
+        "ingest this", "remember this", "consolidate memory",
+    ]
+    return any(word in t for word in memory_words)
 
-Return strict JSON:
-{{
-  "mode": "chat" | "codegen" | "action",
-  "reason": "short reason"
-}}
 
-Task:
-{task}
-"""
-    return _call_json_model(
-        client=client,
+def _run_direct_chat(client: Client, task: str, model: str) -> str:
+    response = _safe_chat(
+        client,
         model=model,
-        system_prompt="You are a task router. Return strict JSON only.",
-        user_prompt=route_prompt,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ],
+        temperature=SETTINGS.ollama_temperature,
     )
+    return response.get("message", {}).get("content", "").strip() or "No response."
 
 
-def _looks_like_action_task(task: str) -> bool:
-    t = task.lower()
-    action_words = [
-        "open", "click", "type", "press", "search", "go to", "visit",
-        "save", "download", "take a screenshot", "focus", "run",
-        "read file", "organize", "move", "launch"
-    ]
-    return any(word in t for word in action_words)
+def _run_memory_query(task: str, model: str) -> str:
+    bundle = run_query(
+        db_path=SETTINGS.memory_db,
+        query=task,
+        model=model,
+        embed_model=SETTINGS.embed_model,
+        host=SETTINGS.ollama_host,
+        timeout=SETTINGS.memory_timeout,
+        seed=SETTINGS.memory_seed,
+        keep_alive=SETTINGS.ollama_keep_alive,
+        think=False,
+        num_ctx=SETTINGS.ollama_num_ctx,
+    )
+    return format_answer_bundle(bundle)
+
 
 def run_agent(task: str, workspace: Path, model: str, max_steps: int) -> str:
     os.environ["WORKSPACE"] = str(workspace.resolve())
     client = Client(host=SETTINGS.ollama_host)
 
-    # Fast path for normal chat/code questions
+    # Fast path: normal chat should not go through the action loop.
     if not _looks_like_action_task(task):
-        response = client.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": task},
-            ],
-            stream=False,
-            options={"temperature": 0.2},
-        )
-        return response["message"].get("content", "").strip() or "No response."
+        if SETTINGS.memory_enabled and _looks_like_memory_task(task) and has_memory_data(SETTINGS.memory_db):
+            try:
+                return _run_memory_query(task, model)
+            except MemoryError as exc:
+                return f"Memory query failed: {exc}"
+        return _run_direct_chat(client, task, model)
 
     planner_model = os.getenv("OLLAMA_PLANNER_MODEL", model)
     verifier_model = os.getenv("OLLAMA_VERIFIER_MODEL", model)
+    history_limit = SETTINGS.planner_history_items
+    verifier_chars = SETTINGS.verifier_output_chars
 
     tools_by_name = _tool_index()
     tool_catalog = _tool_catalog_text()
@@ -214,7 +248,7 @@ AVAILABLE TOOLS:
 {tool_catalog}
 
 RECENT HISTORY:
-{chr(10).join(history[-3:]) if history else "(none)"}
+{chr(10).join(history[-history_limit:]) if history else "(none)"}
 
 Choose the next best single step.
 """
@@ -224,14 +258,19 @@ Choose the next best single step.
             model=planner_model,
             system_prompt=PLANNER_PROMPT,
             user_prompt=planner_input,
+            temperature=SETTINGS.planner_temperature,
         )
 
-        mode = plan.get("mode", "").strip().lower()
-        reason = plan.get("reason", "")
-        tool_name = plan.get("tool_name", "")
+        mode = str(plan.get("mode", "")).strip().lower()
+        reason = str(plan.get("reason", ""))
+        tool_name = str(plan.get("tool_name", ""))
         arguments = plan.get("arguments", {}) or {}
-        success_check = plan.get("success_check", "")
-        planned_final = plan.get("final_answer", "")
+        success_check = str(plan.get("success_check", ""))
+        planned_final = str(plan.get("final_answer", ""))
+
+        print(f"[planner] mode={mode} reason={reason}")
+        if tool_name:
+            print(f"[planner] tool={tool_name} args={arguments}")
 
         if mode == "finish":
             return planned_final or reason or final_text or "Task completed."
@@ -242,12 +281,17 @@ Choose the next best single step.
 
         if tool_name not in tools_by_name:
             history.append(f"Planner chose invalid tool: {tool_name}")
+            print(f"[planner-error] invalid tool: {tool_name}")
             continue
 
         try:
+            print(f"[executor] {tool_name}({arguments})")
             tool_output = execute_tool(tool_name, arguments)
         except Exception as exc:
             tool_output = f"Tool execution failed: {type(exc).__name__}: {exc}"
+
+        tool_output = tool_output or ""
+        print(tool_output[:1600])
 
         verifier_input = f"""TASK:
 {task}
@@ -259,10 +303,10 @@ PLANNED STEP:
 - success_check: {success_check}
 
 TOOL OUTPUT:
-{(tool_output or '')[:1200]}
+{tool_output[:verifier_chars]}
 
 RECENT HISTORY:
-{chr(10).join(history[-3:]) if history else "(none)"}
+{chr(10).join(history[-history_limit:]) if history else "(none)"}
 
 Decide whether the task is done, should continue, or should retry.
 """
@@ -272,12 +316,15 @@ Decide whether the task is done, should continue, or should retry.
             model=verifier_model,
             system_prompt=VERIFIER_PROMPT,
             user_prompt=verifier_input,
+            temperature=SETTINGS.verifier_temperature,
         )
 
-        status = verdict.get("status", "").strip().lower()
-        verify_reason = verdict.get("reason", "")
-        next_hint = verdict.get("next_hint", "")
-        verify_final = verdict.get("final_answer", "")
+        status = str(verdict.get("status", "")).strip().lower()
+        verify_reason = str(verdict.get("reason", ""))
+        next_hint = str(verdict.get("next_hint", ""))
+        verify_final = str(verdict.get("final_answer", ""))
+
+        print(f"[verifier] status={status} reason={verify_reason}")
 
         history.append(
             f"step={step} tool={tool_name} args={arguments} "
@@ -288,6 +335,9 @@ Decide whether the task is done, should continue, or should retry.
 
         if status == "done":
             return verify_final or "Task completed successfully."
+
+        if status == "retry":
+            history.append(f"Verifier requested retry for tool {tool_name}")
 
     return final_text or "Stopped after reaching the step limit."
 

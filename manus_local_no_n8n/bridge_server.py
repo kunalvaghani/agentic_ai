@@ -1,8 +1,8 @@
+
 from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import threading
 import time
@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import subprocess
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -23,6 +22,7 @@ os.environ.setdefault("WORKSPACE", str(ROOT))
 from agent.main import run_agent  # noqa: E402
 from agent.config import SETTINGS  # noqa: E402
 from agent.storage_manager import list_recent_storage, store_text_artifact, storage_root  # noqa: E402
+from agent.memory_os import consolidate_memories, init_db, ingest_document, run_query, format_answer_bundle  # noqa: E402
 
 APP_TITLE = "Manus Local Open WebUI Bridge"
 DEFAULT_MODEL = os.getenv("BRIDGE_AGENT_MODEL", os.getenv("OLLAMA_CHAT_MODEL", SETTINGS.chat_model))
@@ -36,10 +36,10 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title=APP_TITLE,
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "A local bridge that lets Open WebUI trigger the Manus desktop/browser/workspace agent on this PC. "
-        "Run it on the host machine, then connect from Open WebUI as either an OpenAPI Tool Server or through the included Pipe function."
+        "Run it on the host machine, then connect from Open WebUI through the included Pipe function."
     ),
 )
 
@@ -63,57 +63,12 @@ _STATE: dict[str, Any] = {
     "started_at": None,
     "run_id": None,
 }
-STALE_RUN_SECONDS = int(os.getenv("BRIDGE_STALE_RUN_SECONDS", "300"))
 
-def _is_openwebui_meta_task(task: str) -> bool:
-    t = (task or "").lower()
-    return (
-        "suggest 3-5 relevant follow-up questions" in t
-        or '"follow_ups"' in t
-        or "### chat history:" in t
-    )
-
-def _mark_run_started(task: str, run_id: str) -> None:
-    _STATE["busy"] = True
-    _STATE["current_task"] = task
-    _STATE["started_at"] = time.time()
-    _STATE["run_id"] = run_id
-
-def _mark_run_finished() -> None:
-    _STATE["busy"] = False
-    _STATE["current_task"] = None
-    _STATE["started_at"] = None
-    _STATE["run_id"] = None
-
-def _break_stale_run_if_needed() -> None:
-    if _STATE.get("busy") and _STATE.get("started_at"):
-        age = time.time() - float(_STATE["started_at"])
-        if age > STALE_RUN_SECONDS:
-            _mark_run_finished()
-            if _AGENT_LOCK.locked():
-                with contextlib.suppress(RuntimeError):
-                    _AGENT_LOCK.release()
 
 class RunTaskRequest(BaseModel):
-    task: str = Field(
-        ...,
-        description=(
-            "The real-world task to perform on this Windows PC. Examples: "
-            "'Open Notepad and type hello', 'Open youtube.com and search for lofi Bollywood songs', "
-            "or 'Read README.md and summarize the architecture.'"
-        ),
-        min_length=1,
-    )
-    model: str = Field(
-        default=DEFAULT_MODEL,
-        description="Ollama chat model used by the inner autonomous agent.",
-    )
-    max_steps: int = Field(
-        default=DEFAULT_MAX_STEPS,
-        ge=1,
-        le=50,
-        description="Maximum tool loop steps for the inner agent.",
-    )
+    task: str = Field(..., min_length=1)
+    model: str = Field(default=DEFAULT_MODEL)
+    max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1, le=50)
 
 
 class ArtifactItem(BaseModel):
@@ -133,12 +88,24 @@ class RunTaskResponse(BaseModel):
     recent_artifacts: list[ArtifactItem]
 
 
+class DesktopAgentStatusResponse(BaseModel):
+    ok: bool
+    busy: bool
+    workspace: str
+    default_model: str
+    recent_artifacts: list[ArtifactItem]
+    last_run: dict[str, Any] | None
+    current_task: str | None = None
+    started_at: float | None = None
+    run_id: str | None = None
+
+
 class ListArtifactsRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
 
 
 class ReadWorkspaceTextRequest(BaseModel):
-    path: str = Field(..., description="Relative path inside the workspace.")
+    path: str = Field(...)
     max_chars: int = Field(default=12000, ge=1, le=120000)
 
 
@@ -147,14 +114,22 @@ class ReadWorkspaceTextResponse(BaseModel):
     content: str
 
 
-class DesktopAgentStatusResponse(BaseModel):
+class MemoryInitResponse(BaseModel):
     ok: bool
-    busy: bool
-    workspace: str
-    default_model: str
-    recent_artifacts: list[ArtifactItem]
-    last_run: dict[str, Any] | None
+    db: str
+    stats: dict[str, int]
 
+
+class MemoryIngestRequest(BaseModel):
+    source_path: str
+    structure_path: str | None = None
+    doc_id: str | None = None
+
+
+class MemoryQueryRequest(BaseModel):
+    query: str
+    doc_id: str | None = None
+    model: str = Field(default=DEFAULT_MODEL)
 
 
 def _resolve_workspace_path(path_str: str) -> Path:
@@ -162,7 +137,6 @@ def _resolve_workspace_path(path_str: str) -> Path:
     if target != ROOT and ROOT not in target.parents:
         raise HTTPException(status_code=400, detail="Path escapes the project folder.")
     return target
-
 
 
 def _artifact_snapshot() -> dict[str, tuple[float, int]]:
@@ -177,7 +151,6 @@ def _artifact_snapshot() -> dict[str, tuple[float, int]]:
                 stat = file.stat()
                 snapshot[rel] = (stat.st_mtime, stat.st_size)
     return snapshot
-
 
 
 def _recent_artifacts(limit: int = 20) -> list[ArtifactItem]:
@@ -198,7 +171,6 @@ def _recent_artifacts(limit: int = 20) -> list[ArtifactItem]:
     return items[:limit]
 
 
-
 def _changed_artifacts(before: dict[str, tuple[float, int]]) -> list[ArtifactItem]:
     changed: list[ArtifactItem] = []
     after = _artifact_snapshot()
@@ -207,7 +179,6 @@ def _changed_artifacts(before: dict[str, tuple[float, int]]) -> list[ArtifactIte
             changed.append(ArtifactItem(path=rel, modified_unix=mtime, size_bytes=size))
     changed.sort(key=lambda item: item.modified_unix, reverse=True)
     return changed[:20]
-
 
 
 def _write_log(run_id: str, text: str) -> str:
@@ -232,7 +203,6 @@ def _available_ollama_models() -> set[str]:
             line = line.strip()
             if not line:
                 continue
-            # NAME column is first token
             models.add(line.split()[0])
         return models
     except Exception:
@@ -243,7 +213,6 @@ def _sanitize_model_name(model_name: str | None) -> str:
     candidate = (model_name or "").strip()
     if not candidate:
         return DEFAULT_MODEL
-
     blocked = {
         "manus local bridge",
         "manus-local-bridge",
@@ -251,12 +220,47 @@ def _sanitize_model_name(model_name: str | None) -> str:
     }
     if candidate.lower() in blocked:
         return DEFAULT_MODEL
-
     available = _available_ollama_models()
     if available and candidate not in available:
         return DEFAULT_MODEL
-
     return candidate
+
+
+def _is_openwebui_meta_task(task: str) -> bool:
+    t = (task or "").lower()
+    patterns = [
+        "suggest 3-5 relevant follow-up questions",
+        '"follow_ups"',
+        "### chat history:",
+        "generate a concise title",
+        "suggest a short title",
+    ]
+    return any(p in t for p in patterns)
+
+
+def _mark_run_started(task: str, run_id: str) -> None:
+    _STATE["busy"] = True
+    _STATE["current_task"] = task
+    _STATE["started_at"] = time.time()
+    _STATE["run_id"] = run_id
+
+
+def _mark_run_finished() -> None:
+    _STATE["busy"] = False
+    _STATE["current_task"] = None
+    _STATE["started_at"] = None
+    _STATE["run_id"] = None
+
+
+def _break_stale_run_if_needed() -> None:
+    started_at = _STATE.get("started_at")
+    if _STATE.get("busy") and started_at:
+        age = time.time() - float(started_at)
+        if age > SETTINGS.bridge_stale_run_seconds:
+            _mark_run_finished()
+            if _AGENT_LOCK.locked():
+                with contextlib.suppress(RuntimeError):
+                    _AGENT_LOCK.release()
 
 
 @app.get("/health", response_model=DesktopAgentStatusResponse, include_in_schema=False)
@@ -268,17 +272,98 @@ def health() -> DesktopAgentStatusResponse:
         default_model=DEFAULT_MODEL,
         recent_artifacts=_recent_artifacts(limit=10),
         last_run=_STATE.get("last_run"),
+        current_task=_STATE.get("current_task"),
+        started_at=_STATE.get("started_at"),
+        run_id=_STATE.get("run_id"),
     )
 
 
 @app.post("/reset", include_in_schema=False)
 def reset_bridge() -> dict[str, Any]:
-    _STATE["busy"] = False
-    _STATE["last_run"] = None
+    _mark_run_finished()
     if _AGENT_LOCK.locked():
         with contextlib.suppress(RuntimeError):
             _AGENT_LOCK.release()
-    return {"ok": True, "message": "Bridge reset."}
+    return {"ok": True, "message": "Bridge state reset."}
+
+
+@app.post("/memory/init", response_model=MemoryInitResponse, include_in_schema=False)
+def memory_init() -> MemoryInitResponse:
+    result = init_db(SETTINGS.memory_db)
+    return MemoryInitResponse(ok=True, db=result["db"], stats=result["stats"])
+
+
+@app.post("/memory/ingest", include_in_schema=False)
+def memory_ingest(req: MemoryIngestRequest) -> dict[str, Any]:
+    source = _resolve_workspace_path(req.source_path)
+    structure = _resolve_workspace_path(req.structure_path) if req.structure_path else None
+    result = ingest_document(
+        db_path=SETTINGS.memory_db,
+        source_path=source,
+        structure_path=structure,
+        embed_model=SETTINGS.embed_model,
+        host=SETTINGS.ollama_host,
+        timeout=SETTINGS.memory_timeout,
+        doc_id=req.doc_id,
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/memory/query", include_in_schema=False)
+def memory_query(req: MemoryQueryRequest) -> dict[str, Any]:
+    bundle = run_query(
+        db_path=SETTINGS.memory_db,
+        query=req.query,
+        model=_sanitize_model_name(req.model),
+        embed_model=SETTINGS.embed_model,
+        host=SETTINGS.ollama_host,
+        timeout=SETTINGS.memory_timeout,
+        seed=SETTINGS.memory_seed,
+        doc_id=req.doc_id,
+        keep_alive=SETTINGS.ollama_keep_alive,
+        think=False,
+        num_ctx=SETTINGS.ollama_num_ctx,
+    )
+    return {
+        "ok": True,
+        "answer": format_answer_bundle(bundle),
+        "decision": bundle.decision,
+        "reason": bundle.reason,
+        "used_pages": bundle.used_pages,
+        "used_node_ids": bundle.used_node_ids,
+        "used_memory_ids": bundle.used_memory_ids,
+    }
+
+
+@app.post("/memory/consolidate", include_in_schema=False)
+def memory_consolidate() -> dict[str, Any]:
+    result = consolidate_memories(
+        db_path=SETTINGS.memory_db,
+        model=DEFAULT_MODEL,
+        embed_model=SETTINGS.embed_model,
+        host=SETTINGS.ollama_host,
+        timeout=SETTINGS.memory_timeout,
+        seed=SETTINGS.memory_seed,
+        keep_alive=SETTINGS.ollama_keep_alive,
+        think=False,
+        num_ctx=SETTINGS.ollama_num_ctx,
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/list-artifacts", include_in_schema=False)
+def list_artifacts(req: ListArtifactsRequest) -> dict[str, Any]:
+    return {"ok": True, "items": [item.model_dump() for item in _recent_artifacts(req.limit)]}
+
+
+@app.post("/read-workspace-text", response_model=ReadWorkspaceTextResponse, include_in_schema=False)
+def read_workspace_text(req: ReadWorkspaceTextRequest) -> ReadWorkspaceTextResponse:
+    target = _resolve_workspace_path(req.path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found.")
+    content = target.read_text(encoding="utf-8", errors="replace")
+    return ReadWorkspaceTextResponse(path=str(target.relative_to(ROOT)).replace("\\", "/"), content=content[:req.max_chars])
+
 
 @app.post(
     "/run-local-desktop-agent",
@@ -288,24 +373,22 @@ def reset_bridge() -> dict[str, Any]:
     tags=["agent"],
 )
 def run_local_desktop_agent(req: RunTaskRequest) -> RunTaskResponse:
-
-    if _is_openwebui_meta_task(req.task):
-    return RunTaskResponse(
-        ok=True,
-        task=req.task,
-        model=_sanitize_model_name(req.model),
-        max_steps=req.max_steps,
-        duration_seconds=0.0,
-        final_output='{"follow_ups":[]}',
-        log_path="",
-        recent_artifacts=[],
-    )
-
     if not req.task.strip():
         raise HTTPException(status_code=400, detail="Task is empty.")
 
+    if _is_openwebui_meta_task(req.task):
+        return RunTaskResponse(
+            ok=True,
+            task=req.task,
+            model=_sanitize_model_name(req.model),
+            max_steps=req.max_steps,
+            duration_seconds=0.0,
+            final_output='{"follow_ups":[]}',
+            log_path="",
+            recent_artifacts=[],
+        )
+
     _break_stale_run_if_needed()
-    
 
     if not _AGENT_LOCK.acquire(blocking=False):
         raise HTTPException(
@@ -359,26 +442,47 @@ def run_local_desktop_agent(req: RunTaskRequest) -> RunTaskResponse:
                     category="documents",
                 )
             except Exception:
-                output_buffer.write("\n=== storage save warning ===\n")
-                output_buffer.write(traceback.format_exc())
-                log_path = _write_log(run_id, output_buffer.getvalue())
+                pass
+
         changed = _changed_artifacts(before)
-        response_payload = {
-            "ok": error_detail is None,
+        _STATE["last_run"] = {
+            "run_id": run_id,
             "task": req.task,
             "model": effective_model,
-            "max_steps": req.max_steps,
             "duration_seconds": duration,
-            "final_output": final_output or ("Task failed before producing a final answer." if error_detail else ""),
+            "ok": error_detail is None,
+            "error": error_detail,
             "log_path": log_path,
-            "recent_artifacts": [item.model_dump() for item in changed],
+            "changed_artifacts": [item.model_dump() for item in changed],
+            "started_at": started_at,
         }
-        _STATE["last_run"] = response_payload
 
-        if error_detail is not None:
-            raise HTTPException(status_code=500, detail={"error": error_detail, **response_payload})
+        if error_detail:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": error_detail,
+                    "ok": False,
+                    "task": req.task,
+                    "model": effective_model,
+                    "max_steps": req.max_steps,
+                    "duration_seconds": duration,
+                    "final_output": final_output or "Task failed before producing a final answer.",
+                    "log_path": log_path,
+                    "recent_artifacts": [item.model_dump() for item in changed],
+                },
+            )
 
-        return RunTaskResponse(**response_payload)
+        return RunTaskResponse(
+            ok=True,
+            task=req.task,
+            model=effective_model,
+            max_steps=req.max_steps,
+            duration_seconds=duration,
+            final_output=final_output,
+            log_path=log_path,
+            recent_artifacts=changed,
+        )
     finally:
         _mark_run_finished()
         if _AGENT_LOCK.locked():
@@ -386,39 +490,14 @@ def run_local_desktop_agent(req: RunTaskRequest) -> RunTaskResponse:
                 _AGENT_LOCK.release()
 
 
-@app.post(
-    "/list-recent-workspace-artifacts",
-    response_model=list[ArtifactItem],
-    operation_id="list_recent_workspace_artifacts",
-    summary="List recent files created under the workspace artifacts folder",
-    tags=["artifacts"],
-)
-def list_recent_workspace_artifacts(req: ListArtifactsRequest) -> list[ArtifactItem]:
-    return _recent_artifacts(limit=req.limit)
-
-
-@app.post(
-    "/read-workspace-text-file",
-    response_model=ReadWorkspaceTextResponse,
-    operation_id="read_workspace_text_file",
-    summary="Read a UTF-8 text file from the workspace",
-    tags=["workspace"],
-)
-def read_workspace_text_file(req: ReadWorkspaceTextRequest) -> ReadWorkspaceTextResponse:
-    target = _resolve_workspace_path(req.path)
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="File not found.")
-    try:
-        content = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"File is not UTF-8 text: {exc}") from exc
-    return ReadWorkspaceTextResponse(
-        path=str(target.relative_to(ROOT)).replace("\\", "/"),
-        content=content[: req.max_chars],
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="127.0.0.1", port=8787)
+@app.get("/", include_in_schema=False)
+def root() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "app": APP_TITLE,
+        "workspace": str(ROOT),
+        "default_model": DEFAULT_MODEL,
+        "busy": bool(_STATE.get("busy")),
+        "last_run": _STATE.get("last_run"),
+        "recent_storage": list_recent_storage(limit=10),
+    }
